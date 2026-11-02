@@ -13,6 +13,7 @@
 #include "libslic3r/Point.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Line.hpp"
+#include "libslic3r/Polygon.hpp"
 #include "libslic3r/Polyline.hpp"
 
 
@@ -239,5 +240,202 @@ TEST_CASE("Loop smoothness only considers the corners within the requested lengt
         const Vec2d seam = outline[0] + 0.2 * (outline[1] - outline[0]).normalized();
         with_seam.insert(with_seam.begin() + 1, seam);
         CHECK_FALSE(loop_from_seam(with_seam, 1).is_smooth(threshold, arm, 20.));
+    }
+}
+
+TEST_CASE("Every extrusion role name converts back to the same role and an unknown name to no role", "[ExtrusionEntity]")
+{
+    // erCount is not a role: role_to_string() asserts on it.
+    const auto role = static_cast<ExtrusionRole>(GENERATE(range(int(erNone), int(erCount))));
+    CAPTURE(int(role));
+    CHECK(ExtrusionEntity::string_to_role(ExtrusionEntity::role_to_string(role)) == role);
+    CHECK(ExtrusionEntity::string_to_role("no such role") == erNone);
+}
+
+// Hand-written test double. As a stub it returns a fixed role, length and min_mm3_per_mm; as a spy it counts
+// reverse() calls. The counter is a pointer, so the clones ExtrusionEntityCollection makes report to the same int.
+class FakeExtrusion : public ExtrusionEntity
+{
+public:
+    FakeExtrusion(int id, ExtrusionRole role, double mm3_per_mm, bool loop = false, int *reverse_calls = nullptr)
+        : id(id), m_role(role), m_mm3_per_mm(mm3_per_mm), m_loop(loop), m_reverse_calls(reverse_calls) {}
+
+    int id;
+
+    ExtrusionRole    role() const override { return m_role; }
+    bool             is_loop() const override { return m_loop; }
+    ExtrusionEntity *clone() const override { return new FakeExtrusion(*this); }
+    ExtrusionEntity *clone_move() override { return new FakeExtrusion(std::move(*this)); }
+    void             reverse() override { if (m_reverse_calls) ++*m_reverse_calls; }
+    double           min_mm3_per_mm() const override { return m_mm3_per_mm; }
+    double           length() const override { return m_length; }
+
+    Point         first_point() const override { return m_point.to_point(); }
+    Point         last_point() const override { return m_point.to_point(); }
+    const Point3 &first_point3() const override { return m_point; }
+    const Point3 &last_point3() const override { return m_point; }
+    void          polygons_covered_by_width(Polygons &, const float) const override {}
+    void          polygons_covered_by_spacing(Polygons &, const float) const override {}
+    Polyline      as_polyline() const override { return Polyline(); }
+    void          collect_polylines(Polylines &) const override {}
+    void          collect_points(Points &) const override {}
+    double        total_volume() const override { return 0.; }
+
+private:
+    ExtrusionRole m_role;
+    double        m_mm3_per_mm;
+    double        m_length = 1.;
+    bool          m_loop;
+    int          *m_reverse_calls;
+    Point3        m_point;
+};
+
+static int fake_id(const ExtrusionEntity *entity)
+{
+    const auto *fake = dynamic_cast<const FakeExtrusion *>(entity);
+    REQUIRE(fake != nullptr);
+    return fake->id;
+}
+
+TEST_CASE("Reversing a collection reverses its order and its open children but leaves loops alone", "[ExtrusionEntity]")
+{
+    // The counters are declared first so they outlive the clones held by the collection.
+    int first_reversed = 0, loop_reversed = 0, last_reversed = 0;
+    ExtrusionEntityCollection collection;
+    collection.append(FakeExtrusion(1, erSolidInfill, 1., false, &first_reversed));
+    collection.append(FakeExtrusion(2, erPerimeter, 1., true, &loop_reversed));
+    collection.append(FakeExtrusion(3, erSolidInfill, 1., false, &last_reversed));
+
+    collection.reverse();
+
+    REQUIRE(collection.size() == 3);
+    CHECK(fake_id(collection.entities[0]) == 3);
+    CHECK(fake_id(collection.entities[1]) == 2);
+    CHECK(fake_id(collection.entities[2]) == 1);
+    CHECK(first_reversed == 1);
+    CHECK(last_reversed == 1);
+    CHECK(loop_reversed == 0);
+}
+
+TEST_CASE("A collection reports the smallest flow of its children and a mixed role when roles differ", "[ExtrusionEntity]")
+{
+    using Catch::Matchers::WithinAbs;
+    ExtrusionEntityCollection collection;
+    collection.append(FakeExtrusion(1, erSolidInfill, 0.4));
+    collection.append(FakeExtrusion(2, erSolidInfill, 0.15));
+    collection.append(FakeExtrusion(3, erSolidInfill, 0.3));
+
+    CHECK_THAT(collection.min_mm3_per_mm(), WithinAbs(0.15, 1e-9));
+    CHECK(collection.role() == erSolidInfill);
+
+    collection.append(FakeExtrusion(4, erPerimeter, 0.5));
+    CHECK(collection.role() == erMixed);
+}
+
+TEST_CASE("Removing and replacing children keeps the nested item count consistent", "[ExtrusionEntity]")
+{
+    const ExtrusionPath wall = straight_path({0., 1.}).front();
+    ExtrusionEntityCollection nested;
+    nested.append(ExtrusionPaths{wall, wall, wall});
+
+    ExtrusionEntityCollection collection;
+    collection.append(wall);
+    collection.append(nested);
+    collection.append(wall);
+    REQUIRE(collection.size() == 3);
+    CHECK(collection.items_count() == 5); // 2 paths + the 3 paths inside the nested collection
+
+    collection.remove(0);
+    REQUIRE(collection.size() == 2);
+    CHECK(collection.items_count() == 4);
+    CHECK(collection.entities.front()->is_collection());
+
+    ExtrusionPath gap_fill{erGapFill, 0.5, 0.4f, 0.2f};
+    gap_fill.polyline = wall.polyline;
+    collection.replace(1, gap_fill);
+    REQUIRE(collection.size() == 2);
+    CHECK(collection.entities[1]->role() == erGapFill);
+    CHECK(collection.entities[1] != &gap_fill); // the collection stores its own clone
+    CHECK(collection.items_count() == 4);
+}
+
+static ExtrusionPath path_through(ExtrusionRole role, const std::vector<Vec2d> &points)
+{
+    ExtrusionPath path{role, 1.0, 0.45f, 0.2f};
+    for (const Vec2d &p : points)
+        path.polyline.append(Point3::new_scale(p.x(), p.y(), 0.));
+    return path;
+}
+
+TEST_CASE("Making a loop clockwise reverses it only when it runs the other way", "[ExtrusionEntity]")
+{
+    // A 10 mm square traced counter-clockwise.
+    ExtrusionLoop loop(path_through(erExternalPerimeter,
+        {Vec2d(0., 0.), Vec2d(10., 0.), Vec2d(10., 10.), Vec2d(0., 10.), Vec2d(0., 0.)}));
+    REQUIRE(loop.is_counter_clockwise());
+
+    CHECK(loop.make_clockwise());
+    CHECK(loop.is_clockwise());
+    CHECK_FALSE(loop.make_clockwise());
+    CHECK(loop.is_clockwise());
+
+    CHECK(loop.make_counter_clockwise());
+    CHECK(loop.is_counter_clockwise());
+}
+
+TEST_CASE("A two-path loop splits, clips and reports overhangs at the requested points", "[ExtrusionEntity]")
+{
+    using Catch::Matchers::WithinAbs;
+    // A 10 mm counter-clockwise square, 40 mm long: a regular wall on the bottom and right edges,
+    // an overhang wall on the top and left edges.
+    ExtrusionLoop loop(ExtrusionPaths{
+        path_through(erExternalPerimeter, {Vec2d(0., 0.), Vec2d(10., 0.), Vec2d(10., 10.)}),
+        path_through(erOverhangPerimeter, {Vec2d(10., 10.), Vec2d(0., 10.), Vec2d(0., 0.)})});
+    REQUIRE_THAT(unscale<double>(loop.length()), WithinAbs(40., 1e-3));
+
+    SECTION("splitting at a vertex starts the loop there and keeps its length") {
+        CHECK(loop.split_at_vertex(Point::new_scale(10., 10.)));
+        CHECK(loop.first_point() == Point::new_scale(10., 10.));
+        CHECK_THAT(unscale<double>(loop.length()), WithinAbs(40., 1e-3));
+    }
+
+    SECTION("a point that is not a vertex is not split at") {
+        CHECK_FALSE(loop.split_at_vertex(Point::new_scale(5., 5.)));
+        CHECK(loop.first_point() == Point::new_scale(0., 0.));
+    }
+
+    SECTION("splitting inside a segment starts the loop at that point and keeps its length") {
+        loop.split_at(Point::new_scale(5., 0.), false);
+        CHECK(loop.first_point() == Point::new_scale(5., 0.));
+        CHECK_THAT(unscale<double>(loop.length()), WithinAbs(40., 1e-3));
+    }
+
+    SECTION("preferring a non-overhang moves the seam off the overhang wall") {
+        // (5, 10) lies on the overhang edge; the closest point of the regular wall is its corner (10, 10).
+        loop.split_at(Point::new_scale(5., 10.), true);
+        CHECK(loop.first_point() == Point::new_scale(10., 10.));
+        CHECK_THAT(unscale<double>(loop.length()), WithinAbs(40., 1e-3));
+    }
+
+    SECTION("only an inner vertex of a bridging path is an overhang point") {
+        CHECK(loop.has_overhang_point(Point::new_scale(0., 10.)));
+        CHECK_FALSE(loop.has_overhang_point(Point::new_scale(10., 0.)));  // inner vertex of the regular wall
+        CHECK_FALSE(loop.has_overhang_point(Point::new_scale(10., 10.))); // endpoint shared by both paths
+    }
+
+    SECTION("clipping shortens the last path") {
+        ExtrusionPaths clipped;
+        loop.clip_end(scale_(3.), &clipped);
+        REQUIRE(clipped.size() == 2);
+        CHECK_THAT(unscale_(clipped.back().polyline.last_point().x()), WithinAbs(0., 1e-3));
+        CHECK_THAT(unscale_(clipped.back().polyline.last_point().y()), WithinAbs(3., 1e-3));
+    }
+
+    SECTION("clipping more than the last path drops it and shortens the one before") {
+        ExtrusionPaths clipped;
+        loop.clip_end(scale_(25.), &clipped); // the 20 mm overhang path, then 5 mm of the wall
+        REQUIRE(clipped.size() == 1);
+        CHECK_THAT(unscale_(clipped.back().polyline.last_point().x()), WithinAbs(10., 1e-3));
+        CHECK_THAT(unscale_(clipped.back().polyline.last_point().y()), WithinAbs(5., 1e-3));
     }
 }
